@@ -1,4 +1,4 @@
-//! The high-level local-player model, shared between the driver (authoritative sync) and the script
+//! The high-level local-player model, shared between the engine (authoritative sync) and the script
 //! engine's `getBot*`/`setBot*` bindings; see docs/memory/samp-client/state.md#module.
 
 use std::cell::RefCell;
@@ -118,7 +118,7 @@ impl WeaponInventory {
     }
 }
 
-/// The local bot's mutable state, shared between driver and scripts.
+/// The local bot's mutable state, shared between engine and scripts.
 #[derive(Debug, Clone)]
 pub struct LocalPlayer {
     pub nick: String,
@@ -131,23 +131,23 @@ pub struct LocalPlayer {
     pub interior: u8,
     pub score: i32,
     pub camera_pos: Vector3,
-    /// Set by `updateSync()`; the driver sends a sync immediately and clears it.
+    /// Set by `updateSync()`; the engine sends a sync immediately and clears it.
     pub force_sync: bool,
-    /// Set by `reconnect(ms)`; the driver schedules a reconnect after this delay and clears it.
+    /// Set by `reconnect(ms)`; the engine schedules a reconnect after this delay and clears it.
     pub reconnect_in_ms: Option<u64>,
-    /// Set by `sampSpawnPlayer()`; in the Arizona flow the driver sends `RPC_Spawn` and clears it. The
+    /// Set by `sampSpawnPlayer()`; in the Arizona flow the engine sends `RPC_Spawn` and clears it. The
     /// script calls this after the login (or registration) dialog flow completes.
     pub spawn_requested: bool,
-    /// Set by `walkTo(x, y, z, mode)`; the driver plans a navmesh path and starts the native walker.
+    /// Set by `walkTo(x, y, z, mode)`; the engine plans a navmesh path and starts the native walker.
     /// `mode`: 0 = walk, 1 = jog (default), 2 = sprint.
     pub walk_to: Option<(Vector3, u8)>,
-    /// Set by `walkStop()`; the driver aborts the active walk and clears it.
+    /// Set by `walkStop()`; the engine aborts the active walk and clears it.
     pub walk_stop: bool,
-    /// Mirrored by the driver: whether the native walker is currently moving (`isWalking()`).
+    /// Mirrored by the engine: whether the native walker is currently moving (`isWalking()`).
     pub walking: bool,
 }
 
-/// [`LocalPlayer`] shared between the (non-`Send`) driver and script engine on the client thread.
+/// [`LocalPlayer`] shared between the (non-`Send`) engine and script engine on the client thread.
 pub type SharedLocalPlayer = Rc<RefCell<LocalPlayer>>;
 
 impl LocalPlayer {

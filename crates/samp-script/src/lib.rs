@@ -14,6 +14,7 @@ use mlua::{Function, IntoLua, IntoLuaMulti, Lua, Table, Value, Variadic};
 mod bindings;
 mod bitstream;
 mod crypto;
+mod http;
 mod require;
 use samp_proto::{Encode, OutboundMsg, Outbox, Verdict};
 
@@ -42,6 +43,7 @@ impl ScriptEngine {
         lua.globals().set("sampev", lua.create_table()?)?;
         lua.globals().set("__rakHandlers", lua.create_table()?)?;
         install_register_handler(&lua)?;
+        http::install_http(&lua)?;
         require::install_require(&lua)?;
         // `len` is referenced by `addon.lua` (a latent upstream gap); bind it to byte length.
         lua.globals().set(
@@ -136,6 +138,11 @@ impl ScriptEngine {
     /// `reconnect`) bound to the shared bot state the driver mirrors.
     pub fn install_bindings(&self, state: samp_client::SharedLocalPlayer) -> mlua::Result<()> {
         bindings::install_bindings(&self.lua, state)
+    }
+
+    /// Install the read-only streamed-entity queries (`getStreamedPlayers` / `getStreamedVehicles`).
+    pub fn install_entities(&self, entities: samp_client::EntityView) -> mlua::Result<()> {
+        bindings::install_entity_bindings(&self.lua, entities)
     }
 
     /// Install `sampSendPacket(bytes)` / `sampSendRpc(id, bytes)` bound to `outbox`, letting scripts

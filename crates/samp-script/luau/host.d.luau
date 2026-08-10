@@ -66,6 +66,10 @@ declare bitStream: { new: () -> BitStream }
 declare function getBotPosition(): (number, number, number)
 declare function setBotPosition(x: number, y: number, z: number): ()
 declare function setBotVelocity(x: number, y: number, z: number): ()
+-- Face the horizontal direction (dx, dy) — builds the on-wire quaternion about world +Z, the same
+-- encoding the real client sends. Scripts driving movement via setBotPosition must call this or the
+-- reported facing stays frozen and the bot slides sideways across the map.
+declare function setBotFacing(dx: number, dy: number): ()
 declare function setBotAnimation(id: number, flags: number): ()
 declare function getBotRotation(): number
 declare function getBotNick(): string
@@ -74,6 +78,9 @@ declare function getServerAddress(): string
 declare function getBotVehicle(): number
 declare function setBotVehicle(id: number, seat: number): ()
 declare function getBotWeapon(): number
+-- NO-OP (kept for compatibility): the client never arms a weapon the server did not grant. The inventory
+-- mirrors GivePlayerWeapon/SetPlayerArmedWeapon/SetWeaponAmmo/ResetPlayerWeapons only; faking one (e.g. the
+-- rented chainsaw) is the "Чит на оружие(15/1)" kick. Job actions are driven by the RPC-131 pickup report.
 declare function setBotWeapon(id: number, ammo: number?): ()
 declare function getBotMoney(): number
 declare function getBotInterior(): number
@@ -85,9 +92,19 @@ declare function sampSpawnPlayer(): ()
 -- Native navmesh walker (driver-side; needs --navmesh <file.nav>). Fire-and-forget:
 -- poll isWalking() for completion. walkStop() aborts the active walk. `mode` picks the GTA-SA gait:
 -- "walk" (~3.7 u/s), "jog" (default, ~5.4 u/s), or "sprint" (~9.4 u/s).
+-- `mode`: "walk" | "jog" (default) | "sprint", optionally prefixed with "direct " to walk straight at
+-- the point instead of pathing over the navmesh — for spots the bake never covered. A direct walk uses
+-- the same body, gait and reported velocity as a navmesh one; only the route differs.
 declare function walkTo(x: number, y: number, z: number, mode: string?): ()
 declare function walkStop(): ()
 declare function isWalking(): boolean
+
+-- Entities streamed in around the bot, as the client already tracks them for pathing. Read-only and
+-- refreshed once per send tick, so poll them like isWalking(). `model` is present only where the
+-- server told us (players streamed in via RPC 32).
+export type StreamedEntity = { id: number, x: number, y: number, z: number, model: number? }
+declare function getStreamedPlayers(): { StreamedEntity }
+declare function getStreamedVehicles(): { StreamedEntity }
 declare function reconnect(ms: number): ()
 
 -- Outgoing wire (`src/lib.rs`).

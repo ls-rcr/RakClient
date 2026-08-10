@@ -16,6 +16,7 @@ const MODULES: &[(&str, &str)] = &[
     ("addon", include_str!("../luau/addon.luau")),
     ("packet", include_str!("../luau/packet.luau")),
     ("fly", include_str!("../luau/fly.luau")),
+    ("http", include_str!("../luau/http.luau")),
     ("arizona", include_str!("../luau/arizona.luau")),
     ("arizona.type3", include_str!("../luau/arizona/type3.luau")),
     ("samp.raknet", include_str!("../luau/samp/raknet.luau")),

@@ -36,7 +36,7 @@ cargo run -p app -- --server <host:port> --nick <Nick> [--scripts-dir <dir>]
 RUST_LOG=info ./target/release/rakclient.exe --server bumblebee.arizona-rp.com:7777 --nick <Nick>
 ```
 
-`RUST_LOG` targets are the crate paths (`rakclient`, `raknet::transport`, `samp_client::driver`,
+`RUST_LOG` targets are the crate paths (`rakclient`, `raknet::transport`, `samp_client::engine`,
 `samp_proto`). Use `raknet::transport=trace` to see every datagram as hex.
 
 ## Architecture
@@ -58,7 +58,7 @@ Layered workspace; each crate is one seam. Dependencies point downward only.
   reliability layer through the cipher, `tokio::select!` over recv/command/tick). `wire.rs` holds the
   handshake/RPC framing constants shared with `test-support` so client and mock frame identically.
 
-- **`samp-client`** — the connection state machine. `driver.rs` `Driver<T: Transport>` is the FSM,
+- **`samp-client`** — the connection state machine. `engine/mod.rs` `Engine<T: Transport>` is the FSM,
   generic over the transport seam so it runs against a scripted fake in unit tests and the real
   `raknet` in production; packet bodies are encoded/decoded through the `samp_proto` `Encode`/`Decode`
   traits. `lib.rs` exposes `Client`, `ClientConfig`(+builder),

@@ -1,6 +1,5 @@
-//! Native aim-sync emulation (ported from `aim_fix_updated.lua`): periodically, while standing still,
-//! sends a believable aim packet so a bare bot doesn't look unnatural; see
-//! docs/memory/samp-client/aim.md#module.
+//! Native aim-sync emulation (ported from `aim_fix_updated.lua`): periodically sends a believable
+//! aim packet so a bare bot doesn't look unnatural; see docs/memory/samp-client/aim.md#module.
 
 use std::time::{Duration, Instant};
 
@@ -8,33 +7,35 @@ use samp_proto::{AimSyncData, Encode, Quaternion, Vector3};
 
 use crate::state::AimData;
 
-/// `camExtZoom = 63` (max, 6 bits) — matches the reference.
-const CAM_EXT_ZOOM: u8 = 63;
+// WHY: 62, not 63 (the 6-bit max): over real captures 62 is the mode (69.2%) and 63 only 25.9%;
+// "restoring" the max shifts every packet off the measured mode.
+const CAM_EXT_ZOOM: u8 = 62;
 const ASPECT_RATIO: u8 = 85;
-const AIM_MIN_SECS: u64 = 5;
-const AIM_MAX_SECS: u64 = 60;
+// INVARIANT: a real on-foot client sends 203 at ~1 Hz, moving or not (samp.dll SendAimSync,
+// ~100 ms while FIRE/AIM held); with the 100 ms on-foot tick the 203/207 ratio must stay inside
+// the measured IQR 0.082–0.121 — slower, or suppressed while moving, sits below the real p05.
+const AIM_MIN_MILLIS: u64 = 800;
+const AIM_MAX_MILLIS: u64 = 1200;
 
 /// Aim-sync state machine; see docs/memory/samp-client/aim.md#aimsync-usage.
 pub(crate) struct AimSync {
     rng: u64,
-    last_pos: Vector3,
     aim: AimData,
     next_at: Option<Instant>,
     is_regular_pos: bool,
     cam_offset: Vector3,
-    bot_moved: bool,
+    cam_rel: Vector3,
 }
 
 impl AimSync {
     pub(crate) fn new(seed: u64) -> Self {
         Self {
             rng: seed | 1,
-            last_pos: Vector3::default(),
             aim: AimData::default(),
             next_at: None,
             is_regular_pos: false,
             cam_offset: Vector3::default(),
-            bot_moved: false,
+            cam_rel: Vector3::default(),
         }
     }
 
@@ -46,34 +47,29 @@ impl AimSync {
         rotation: Quaternion,
         in_vehicle: bool,
     ) {
-        self.last_pos = pos;
         self.generate(pos, rotation, in_vehicle, false);
         self.schedule(now);
     }
 
-    /// Note the bot's current position; a position change marks it moving, suppressing the next send.
+    // WHY: re-pins the camera unconditionally, not only on movement — `spoof_aim` bumps
+    // `cam_pos.z` on every send, so skipping the re-pin while standing would accumulate that
+    // bump into a steady camera climb at the ~1 Hz cadence.
     pub(crate) fn on_position(&mut self, pos: Vector3) {
-        if pos != self.last_pos {
-            self.bot_moved = true;
-        }
-        self.last_pos = pos;
+        self.aim.cam_pos = Vector3 {
+            x: pos.x + self.cam_rel.x,
+            y: pos.y + self.cam_rel.y,
+            z: pos.z + self.cam_rel.z,
+        };
     }
 
     /// The server repositioned the bot: regenerate the aim and send it on the next tick.
     pub(crate) fn on_reposition(&mut self, pos: Vector3, rotation: Quaternion, in_vehicle: bool) {
-        self.last_pos = pos;
         self.generate(pos, rotation, in_vehicle, self.is_regular_pos);
         self.is_regular_pos = true;
         self.next_at = Some(Instant::now() - Duration::from_secs(1)); // due now
     }
 
-    /// Whether an aim send is due (and the bot is still), rescheduling the next; see
-    /// docs/memory/samp-client/aim.md#due.
     pub(crate) fn due(&mut self, now: Instant) -> bool {
-        if self.bot_moved {
-            self.bot_moved = false;
-            return false;
-        }
         match self.next_at {
             Some(at) if at <= now => {
                 self.schedule(now);
@@ -83,7 +79,7 @@ impl AimSync {
         }
     }
 
-    /// The current aim (the high-level view the driver mirrors into `LocalPlayer`).
+    /// The current aim (the high-level view the engine mirrors into `LocalPlayer`).
     pub(crate) fn aim(&self) -> &AimData {
         &self.aim
     }
@@ -109,14 +105,14 @@ impl AimSync {
     /// Reset on disconnect.
     pub(crate) fn reset(&mut self) {
         self.is_regular_pos = false;
-        self.bot_moved = false;
         self.cam_offset = Vector3::default();
+        self.cam_rel = Vector3::default();
         self.next_at = None;
     }
 
     fn schedule(&mut self, now: Instant) {
-        let secs = AIM_MIN_SECS + self.next_u64() % (AIM_MAX_SECS - AIM_MIN_SECS + 1);
-        self.next_at = Some(now + Duration::from_secs(secs));
+        let millis = AIM_MIN_MILLIS + self.next_u64() % (AIM_MAX_MILLIS - AIM_MIN_MILLIS + 1);
+        self.next_at = Some(now + Duration::from_millis(millis));
     }
 
     /// `genAimSyncInfo`: camera ~2 units behind the bot per its yaw, plus a random offset, looking
@@ -126,10 +122,15 @@ impl AimSync {
             self.cam_offset = self.random_vector(0.1, 1.5);
         }
         let angle = -yaw_degrees(rotation) * std::f32::consts::PI / 180.0;
+        self.cam_rel = Vector3 {
+            x: -2.0 * angle.sin() + self.cam_offset.x,
+            y: -2.0 * angle.cos() + self.cam_offset.y,
+            z: 1.0 + self.cam_offset.z,
+        };
         let cam = Vector3 {
-            x: pos.x - 2.0 * angle.sin() + self.cam_offset.x,
-            y: pos.y - 2.0 * angle.cos() + self.cam_offset.y,
-            z: pos.z + 1.0 + self.cam_offset.z,
+            x: pos.x + self.cam_rel.x,
+            y: pos.y + self.cam_rel.y,
+            z: pos.z + self.cam_rel.z,
         };
         let cam_front = if is_static {
             self.aim.cam_front
@@ -207,36 +208,59 @@ mod tests {
     use samp_proto::SyncPacketId;
 
     #[test]
-    fn sends_when_due_and_still_then_reschedules() {
+    fn sends_when_due_then_reschedules() {
         let mut aim = AimSync::new(0xDEAD_BEEF);
         let t0 = Instant::now();
         aim.arm(t0, Vector3::default(), Quaternion::default(), false);
-        // Not due yet (scheduled 5–60s out).
         assert!(!aim.due(t0));
-        // Far in the future → due. Packet is [203] + 31-byte AimSyncData.
-        let later = t0 + Duration::from_secs(120);
+        let later = t0 + Duration::from_secs(2);
         assert!(aim.due(later));
         let packet = aim.encode();
         assert_eq!(packet[0], SyncPacketId::AimSync as u8);
         assert_eq!(packet.len(), 1 + 31);
-        // Immediately after, not due again.
         assert!(!aim.due(later));
     }
 
     #[test]
-    fn moving_suppresses_one_cycle() {
+    fn keeps_sending_while_moving_and_camera_follows() {
         let mut aim = AimSync::new(1);
         let t0 = Instant::now();
         aim.arm(t0, Vector3::default(), Quaternion::default(), false);
+        let cam0 = aim.aim().cam_pos;
         aim.on_position(Vector3 {
             x: 5.0,
-            y: 0.0,
-            z: 0.0,
-        }); // moved
-        let later = t0 + Duration::from_secs(120);
-        assert!(!aim.due(later), "suppressed while moving");
-        // Next cycle, standing still → sends.
-        assert!(aim.due(later));
+            y: -3.0,
+            z: 1.0,
+        });
+        let cam1 = aim.aim().cam_pos;
+        assert!((cam1.x - cam0.x - 5.0).abs() < 1e-4);
+        assert!((cam1.y - cam0.y + 3.0).abs() < 1e-4);
+        assert!((cam1.z - cam0.z - 1.0).abs() < 1e-4);
+        assert!(aim.due(t0 + Duration::from_secs(2)), "sends while moving");
+    }
+
+    #[test]
+    fn walking_minute_ratio_lands_in_real_iqr() {
+        let mut aim = AimSync::new(42);
+        let t0 = Instant::now();
+        aim.arm(t0, Vector3::default(), Quaternion::default(), false);
+        let mut sends = 0u32;
+        for tick in 1u32..=600 {
+            let now = t0 + Duration::from_millis(u64::from(tick) * 100);
+            aim.on_position(Vector3 {
+                x: tick as f32 * 0.15,
+                y: 0.0,
+                z: 3.0,
+            });
+            if aim.due(now) {
+                sends += 1;
+            }
+        }
+        let ratio = f64::from(sends) / 600.0;
+        assert!(
+            (0.082..=0.121).contains(&ratio),
+            "203/207 ratio {ratio} outside real IQR"
+        );
     }
 
     #[test]

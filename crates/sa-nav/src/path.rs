@@ -13,6 +13,11 @@ const MIN_GROUND_STEP: f32 = 1.0;
 /// Recursion cap for segment grounding: 2^6 = up to 64 samples per original segment,
 /// resolving a ~64 m run to ~1 m steps — well past any real sawmill leg.
 const MAX_GROUND_DEPTH: u32 = 6;
+/// Max gap (metres) between an off-mesh target and its boundary clamp before we refuse the final
+/// hop onto the exact target. A small gap means the target is just off a walkable edge (a ledge or
+/// a chop spot) — hop to it. A large gap means it sits inside a carved obstacle (a tree trunk) or
+/// beyond the world — stop at the trunk edge instead of walking the ped into it.
+const OFF_MESH_HOP_MAX: f32 = 1.5;
 
 /// Pathfinding view over a navmesh: precomputed poly centroids + queries.
 pub struct NavQuery {
@@ -89,6 +94,30 @@ impl NavQuery {
 
     /// Waypoints from `from` to `to` (SA space): A* corridor + funnel string-pull, each grounded on the detail mesh; `None` if off-mesh/disconnected; see docs/memory/sa-nav/path.md#find-path
     pub fn find_path(&self, from: [f32; 3], to: [f32; 3]) -> Option<Vec<[f32; 3]>> {
+        self.find_path_inner(from, to, None)
+    }
+
+    /// As [`find_path`](Self::find_path), but each intermediate corner is nudged a small, bounded
+    /// distance along its OWN shared-edge portal (never off it, so it's always still exactly on the two
+    /// polys' shared boundary — the walk stays 100% on-mesh) — repeated trips between the same two
+    /// points stop being pixel-identical. `seed` makes the jitter reproducible per call (vary it — e.g.
+    /// a fresh random per walkTo — for different routes each time); the start/end legs are never jittered
+    /// (their portals are degenerate: `left == right`), so proximity-critical final stands are unaffected.
+    pub fn find_path_with_variety(
+        &self,
+        from: [f32; 3],
+        to: [f32; 3],
+        seed: u64,
+    ) -> Option<Vec<[f32; 3]>> {
+        self.find_path_inner(from, to, Some(seed))
+    }
+
+    fn find_path_inner(
+        &self,
+        from: [f32; 3],
+        to: [f32; 3],
+        variety_seed: Option<u64>,
+    ) -> Option<Vec<[f32; 3]>> {
         let start = self.locate(from)?;
         let goal = self.locate(to)?;
         // Clamp off-mesh endpoints onto their located polys: the off-mesh leg
@@ -143,10 +172,13 @@ impl NavQuery {
         }
         let mut last = from_c;
         let mut last_i = 0usize;
-        for &(ci, corner) in &corners {
+        for (corner_idx, &(ci, corner)) in corners.iter().enumerate() {
             self.push_crossings(&portals, last_i + 1, ci, last, corner, &mut out);
             let mut wp = corner;
             if let Some(portal) = portals.get(ci) {
+                if let Some(seed) = variety_seed {
+                    wp = loosen_corner(portal, wp, seeded_unit(seed, corner_idx));
+                }
                 if let Some(z) = self.ground_height(portal.poly, wp[0], wp[1]) {
                     wp[2] = z;
                 }
@@ -172,9 +204,15 @@ impl NavQuery {
             Some(p) if xy_close(*p, to_c) => *p = to_c,
             _ => out.push(to_c),
         }
-        if !xy_close(to_c, to) {
-            // Off-mesh target: leave the mesh at the clamp point, then hop the
-            // final off-mesh stretch to the exact `to`.
+        let gap2 = {
+            let (dx, dy) = (to[0] - to_c[0], to[1] - to_c[1]);
+            dx * dx + dy * dy
+        };
+        if !xy_close(to_c, to) && gap2 <= OFF_MESH_HOP_MAX * OFF_MESH_HOP_MAX {
+            // Off-mesh target just past a walkable edge: leave the mesh at the clamp
+            // point, then hop the final stretch to the exact `to`. A larger gap means
+            // `to` is inside a carved obstacle (a tree trunk) — we stop at `to_c` (the
+            // trunk edge, already the last waypoint) instead of walking the ped in.
             let mut dest = to;
             if let Some(z) = self.ground_height(goal, to[0], to[1]) {
                 dest[2] = z;
@@ -520,6 +558,46 @@ fn xy_close(a: [f32; 3], b: [f32; 3]) -> bool {
     dx * dx + dy * dy < 1e-6
 }
 
+/// Fractional cap on how far a jittered corner may slide toward the portal's other endpoint.
+const CORNER_LOOSENESS_FRAC: f32 = 0.18;
+/// Absolute cap (metres) regardless of portal width, so a wide-open portal doesn't get an oversized jump.
+const CORNER_LOOSENESS_MAX: f32 = 0.6;
+
+/// Nudge a funnel corner (always exactly `portal.left` or `portal.right`) a bounded distance `t01`-of-the-
+/// way toward the portal's OTHER endpoint. Confined to that single edge — the shared boundary of two
+/// walkable polys — so the result is always still exactly on-mesh; a degenerate (zero-width) portal is a
+/// no-op. See [`NavQuery::find_path_with_variety`].
+fn loosen_corner(portal: &Portal, corner: [f32; 3], t01: f32) -> [f32; 3] {
+    let other = if xy_close(corner, portal.left) {
+        portal.right
+    } else {
+        portal.left
+    };
+    let (dx, dy) = (other[0] - corner[0], other[1] - corner[1]);
+    let width = (dx * dx + dy * dy).sqrt();
+    if width < 1e-6 {
+        return corner;
+    }
+    let max_t = (CORNER_LOOSENESS_MAX / width).min(CORNER_LOOSENESS_FRAC);
+    let t = t01 * max_t;
+    [corner[0] + dx * t, corner[1] + dy * t, corner[2]]
+}
+
+/// Deterministic pseudo-random value in `[0, 1)` from `(seed, idx)` (splitmix64) — reproducible per call
+/// (same seed ⇒ same jitter, useful for tests), varying per corner within one path and across calls that
+/// pass a fresh seed.
+fn seeded_unit(seed: u64, idx: usize) -> f32 {
+    let mut x = seed
+        .wrapping_add(idx as u64)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((x >> 40) as f32) / ((1u64 << 24) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +812,27 @@ mod tests {
         assert!(
             (end[2] - 0.8).abs() < 0.05,
             "target grounded to the hump slope, got {end:?}"
+        );
+    }
+
+    /// A target just past a walkable edge (1 m off) is hopped onto exactly; a target deep off the
+    /// edge (2 m off, e.g. inside a carved trunk) stops at the boundary clamp instead of walking in.
+    #[test]
+    fn off_mesh_target_far_stops_at_boundary() {
+        let q = NavQuery::new(strip());
+        // 1 m off the right edge (x=20): within the hop threshold — lands exactly on the target.
+        let near = q.find_path([2.0, 5.0, 5.0], [21.0, 5.0, 5.0]).unwrap();
+        assert_eq!(
+            *near.last().unwrap(),
+            [21.0, 5.0, 5.0],
+            "near target hopped onto"
+        );
+        // 2 m off (> OFF_MESH_HOP_MAX): stops at the clamped boundary point x=20, never reaches x=22.
+        let far = q.find_path([2.0, 5.0, 5.0], [22.0, 5.0, 5.0]).unwrap();
+        let end = *far.last().unwrap();
+        assert!(
+            (end[0] - 20.0).abs() < 1e-3,
+            "far off-mesh target should stop at the boundary x=20, got {end:?}"
         );
     }
 

@@ -41,6 +41,14 @@ const KEEPALIVE: Duration = Duration::from_secs(8);
 /// [`KEEPALIVE`] (8 s) and the server streams pongs/ACKs/sync constantly, so ~2 missed cycles of total
 /// silence means dead; tear down so the driver reconnects instead of sending sync into the void.
 const PEER_TIMEOUT: Duration = Duration::from_secs(15);
+/// Once connected, if no actual game MESSAGE is delivered for this long the game stream is frozen even
+/// though the RakNet link is alive. `PEER_TIMEOUT` only proves the *link* (a bare ACK/NAK resets it), so
+/// a server that keeps auto-ACKing our reliable sends while it has ghosted us from the world (dropped us
+/// server-side, or an AC soft-kick) never trips it — the client pumps sync into a frozen world for 20+
+/// min (confirmed live: zero server chat/broadcasts for 20 min while still "Spawned"). This separate,
+/// message-level watchdog catches that: a populated SA-MP server streams chat/broadcasts/other-player
+/// sync constantly, so a full minute with no delivered message means the game stream is dead.
+const GAME_STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// Receive buffer sized for the largest possible UDP datagram (65507 B payload). Oversized reads on
 /// Windows fail the recv with `WSAEMSGSIZE` rather than truncating like Linux, so we never want a
 /// datagram to exceed this.
@@ -194,13 +202,22 @@ async fn probe_exit(
     // different IP (e.g. SOAX residential), the server drops our packets no matter how many sessions
     // we rotate. Best-effort: only reject on a *confirmed* mismatch; an inconclusive probe falls
     // through to the UDP query below, which stays the ultimate pass/fail.
-    let udp_ip = crate::socks5::stun_exit_ip(&socket, assoc.relay).await;
-    let tcp_ip = crate::socks5::tcp_exit_ip(cfg).await;
-    if let (Some(udp), Some(tcp)) = (udp_ip, tcp_ip) {
-        if udp != tcp {
-            return Err(ProbeFail::SplitExit { tcp, udp });
+    //
+    // The STUN check rides its OWN dedicated association/socket, never `assoc`/`socket` — some
+    // providers (confirmed on SOAX) pin an association to the first destination sent over it and
+    // silently drop packets to any other destination, so probing STUN over `assoc` would poison the
+    // game-server query below and read as "no UDP relay" even though the exit relays UDP fine.
+    if let Ok(stun_assoc) = crate::socks5::udp_associate(cfg).await {
+        if let Ok(stun_socket) = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
+            let udp_ip = crate::socks5::stun_exit_ip(&stun_socket, stun_assoc.relay).await;
+            let tcp_ip = crate::socks5::tcp_exit_ip(cfg).await;
+            if let (Some(udp), Some(tcp)) = (udp_ip, tcp_ip) {
+                if udp != tcp {
+                    return Err(ProbeFail::SplitExit { tcp, udp });
+                }
+                tracing::debug!(exit = %tcp, "proxy TCP+UDP share one exit IP");
+            }
         }
-        tracing::debug!(exit = %tcp, "proxy TCP+UDP share one exit IP");
     }
 
     // Whitelist the exit IP (best-effort; the UDP probe below is the real pass/fail).
@@ -263,8 +280,11 @@ struct PeerTask {
     last_keepalive: Instant,
     last_query_ping: Instant,
     /// When we last received any real RakNet datagram from the peer (excludes `SAMP` query pongs).
-    /// Drives the connected-phase dead-peer timeout (see [`PEER_TIMEOUT`]).
+    /// Drives the connected-phase dead-peer timeout (see [`PEER_TIMEOUT`]). A bare ACK/NAK resets this.
     last_recv: Instant,
+    /// When the peer last delivered an actual game MESSAGE (not a bare ACK/NAK). Drives the game-stream
+    /// watchdog (see [`GAME_STREAM_TIMEOUT`]) that catches a ghosted-but-still-ACKing peer.
+    last_message: Instant,
     /// Whether the open-connection request has been sent yet. Held back until the server's `SAMP`
     /// query reply confirms our IP is whitelisted through the anti-DDoS filter (or the fallback).
     open_sent: bool,
@@ -324,6 +344,7 @@ impl PeerTask {
             last_keepalive: now,
             last_query_ping: now - QUERY_PING_INTERVAL,
             last_recv: now,
+            last_message: now,
             open_sent: false,
             tunnel,
             pcap,
@@ -545,6 +566,20 @@ impl PeerTask {
                     .await;
                 return false;
             }
+            // Game-stream watchdog: the link is alive (ACKs arriving) but no actual message has been
+            // delivered for GAME_STREAM_TIMEOUT — the server has ghosted us from the world while still
+            // ACKing our reliable sends. Tear down so the driver reconnects instead of pumping sync into
+            // a frozen world (the 20-min-silent-but-"Spawned" live bug).
+            let frozen = now.duration_since(self.last_message);
+            if frozen >= GAME_STREAM_TIMEOUT {
+                tracing::warn!(
+                    secs = frozen.as_secs(),
+                    "game stream frozen (link alive, no messages) — disconnecting"
+                );
+                self.emit(RakEvent::Disconnected(DisconnectReason::Timeout))
+                    .await;
+                return false;
+            }
             if now.duration_since(self.last_keepalive) >= KEEPALIVE {
                 self.last_keepalive = now;
                 self.rel
@@ -598,10 +633,11 @@ impl PeerTask {
             }
             return true;
         }
-        // Any real RakNet datagram is a life sign from the peer — reset the dead-peer timeout. (SAMP
-        // query pongs above are excluded, so a server whose game stream froze but whose query port
-        // still answers is still detected as dead.)
-        self.last_recv = Instant::now();
+        // NOTE: the dead-peer timeout (`last_recv`) is reset ONLY after a datagram parses as a real
+        // RakNet frame (below), NOT on mere arrival. Over SOCKS5 the relay keeps delivering unparseable
+        // UDP from the relay IP (its own keepalives / stray relayed packets) long after the game server
+        // has timed us out — bumping last_recv on arrival kept it fresh forever, so PEER_TIMEOUT never
+        // fired and the client pumped sync into a frozen world for 45 min without reconnecting (live bug).
         let first = raw.first().copied().unwrap_or(0);
         if self.phase != Phase::Connected && is_offline_id(first) {
             tracing::trace!(dir = "in", kind = "offline", id = first, bytes = %hex(raw), "recv");
@@ -617,6 +653,17 @@ impl PeerTask {
                 return true;
             }
         };
+        // Parsed as a real RakNet datagram → a genuine life sign from the peer. Reset the dead-peer
+        // timeout here (a pure ACK/NAK delivers no messages but still proves the link is alive). SAMP
+        // query pongs (handled above) and unparseable relay noise never reach this point, so a server
+        // whose game stream has frozen is correctly detected as dead within PEER_TIMEOUT.
+        self.last_recv = now;
+        // An ACTUAL game message (not a bare ACK/NAK) additionally proves the game stream is flowing.
+        // Only this resets the game-stream watchdog — so a peer that keeps ACKing our reliable sends
+        // while delivering zero messages (a server-side ghost/soft-kick) trips GAME_STREAM_TIMEOUT.
+        if !delivered.is_empty() {
+            self.last_message = now;
+        }
         tracing::trace!(
             count = delivered.len(),
             ids = ?delivered.iter().map(|m| m.first().copied()).collect::<Vec<_>>(),
@@ -843,6 +890,28 @@ mod tests {
 
         assert!(alive, "recently-heard peer keeps running");
         assert!(evt_rx.try_recv().is_err(), "no disconnect expected");
+    }
+
+    #[tokio::test]
+    async fn game_stream_frozen_disconnects_when_only_acks_arrive() {
+        // The link is alive — a bare ACK/NAK just kept `last_recv` fresh — but no actual game message
+        // has been delivered for past GAME_STREAM_TIMEOUT. That's a server-side ghost (it keeps ACKing
+        // our reliable sends while it dropped us from the world); tear down so the driver reconnects.
+        let (mut task, _cmd_tx, mut evt_rx) = connected_task().await;
+        let now = Instant::now();
+        task.last_recv = now; // link proven alive by ACKs
+        task.last_message = now - GAME_STREAM_TIMEOUT - Duration::from_secs(1); // but no message in over a minute
+
+        let alive = task.on_tick().await;
+
+        assert!(
+            !alive,
+            "a ghosted peer (ACKs but no messages) should stop the task"
+        );
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(RakEvent::Disconnected(DisconnectReason::Timeout))
+        ));
     }
 
     /// Drives two reliability layers across real loopback `UdpSocket`s through the cipher, with the

@@ -92,19 +92,19 @@ impl PacketRegistry {
         self
     }
 
-    /// Register a periodic tick handler (fired on the driver's update interval).
+    /// Register a periodic tick handler (fired on the engine's update interval).
     pub fn on_update(&mut self, handler: impl Fn() + 'static) -> &mut Self {
         self.update.push(Box::new(handler));
         self
     }
 
-    /// Whether any periodic handler is registered (the driver only arms its update timer if so).
+    /// Whether any periodic handler is registered (the engine only arms its update timer if so).
     pub fn wants_update(&self) -> bool {
         !self.update.is_empty() || !self.lifecycle.is_empty()
     }
 
     /// Register a connection-lifecycle handler (e.g. `"onConnect"`, `"onInitGame"`), fired by the
-    /// driver at the corresponding FSM point so scripts can send packets in sequence.
+    /// engine at the corresponding FSM point so scripts can send packets in sequence.
     pub fn on_lifecycle(&mut self, event: &'static str, handler: impl Fn() + 'static) -> &mut Self {
         self.lifecycle
             .entry(event)

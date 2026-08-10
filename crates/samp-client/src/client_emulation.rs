@@ -10,7 +10,10 @@ use samp_proto::events::incoming::{
 };
 use samp_proto::events::outgoing::SendClientCheckResponse;
 use samp_proto::events::{decode_event, encode_event};
-use samp_proto::{encode_weapons_update, OutboundMsg, SyncPacketId, RELIABILITY_RELIABLE_ORDERED};
+use samp_proto::{
+    encode_weapons_update, OutboundMsg, SyncPacketId, WeaponSlot, RELIABILITY_RELIABLE_ORDERED,
+    WEAPON_SLOTS,
+};
 
 use crate::state::{AimData, LocalPlayer};
 
@@ -23,6 +26,8 @@ pub(crate) struct ClientEmulation {
     uptime_base: f32,
     z_cam: f32,
     next_weapons_update: Instant,
+    /// Last inventory we declared, so 204 is sent on CHANGE only (see `due_weapons_update`).
+    last_weapons: Option<[WeaponSlot; WEAPON_SLOTS]>,
     ping_next_update: Instant,
     ping_key_action: bool,
     model_hashes: HashMap<u32, u8>,
@@ -40,6 +45,7 @@ impl ClientEmulation {
             uptime_base,
             z_cam,
             next_weapons_update: now,
+            last_weapons: None,
             ping_next_update: now + secs(&mut rng, 10, 120),
             ping_key_action: false,
             model_hashes: HashMap::new(),
@@ -79,15 +85,24 @@ impl ClientEmulation {
         lp: &LocalPlayer,
         now: Instant,
     ) -> Option<OutboundMsg> {
-        if now < self.next_weapons_update {
+        // PACKET_WEAPONS_UPDATE (204) is sent on inventory CHANGE, never on a timer. Ground truth from the
+        // captures: a 97 s real-Arizona-client capture contains ZERO outbound 204s, while we were emitting
+        // ~2/s (100 in 45 s), each redeclaring all 13 slots. Unsolicited periodic inventory declarations are
+        // a headless tell and are what earned the "Чит на оружие(15/1)" kick — our slots were correctly
+        // EMPTY, so it was the cadence, not faked weapons. A weaponless bot now sends none at all.
+        if self.last_weapons == Some(lp.weapons.slots) {
             return None;
         }
+        if now < self.next_weapons_update {
+            return None; // rate-limit the change itself, so a rapid give/take burst can't machine-gun 204s
+        }
+        self.last_weapons = Some(lp.weapons.slots);
         self.next_weapons_update = now + millis(&mut self.rng, 200, 500);
         Some(weapons_update_msg(lp))
     }
 
     /// React to a server RPC, returning packets/RPCs to send back. Position RPCs
-    /// (`SetPlayerPos`/`FindZ`/`InterpolateCamera`) are handled by the driver's aim-follow path.
+    /// (`SetPlayerPos`/`FindZ`/`InterpolateCamera`) are handled by the engine's aim-follow path.
     pub(crate) fn on_incoming_rpc(
         &mut self,
         lp: &mut LocalPlayer,
@@ -348,15 +363,41 @@ mod tests {
     }
 
     #[test]
-    fn weapons_update_is_rate_limited() {
+    fn weapons_update_is_sent_on_change_only() {
+        // A real Arizona client never streams 204 on a timer — a 97 s capture of it contains ZERO, while we
+        // were emitting ~2/s. That unsolicited periodic inventory declaration is a headless tell and is what
+        // earned "Чит на оружие(15/1)" even though our slots were correctly EMPTY. So: declare once, then stay
+        // SILENT while the inventory is unchanged no matter how much time passes; only a real change
+        // re-declares (itself still rate-limited so a give/take burst can't machine-gun 204s).
         let now = Instant::now();
         let mut e = ClientEmulation::new(3, now);
-        let player = lp();
-        assert!(e.due_weapons_update(&player, now).is_some());
-        assert!(e.due_weapons_update(&player, now).is_none());
-        assert!(e
-            .due_weapons_update(&player, now + Duration::from_secs(1))
-            .is_some());
+        let mut player = lp();
+
+        assert!(
+            e.due_weapons_update(&player, now).is_some(),
+            "first declaration"
+        );
+        assert!(
+            e.due_weapons_update(&player, now).is_none(),
+            "unchanged → silent"
+        );
+        assert!(
+            e.due_weapons_update(&player, now + Duration::from_secs(1))
+                .is_none(),
+            "unchanged must stay silent even once the timer elapses — this is the anti-tell property"
+        );
+
+        player.weapons.give(24, 100);
+        assert!(
+            e.due_weapons_update(&player, now + Duration::from_secs(2))
+                .is_some(),
+            "a real inventory change re-declares"
+        );
+        assert!(
+            e.due_weapons_update(&player, now + Duration::from_secs(3))
+                .is_none(),
+            "and then goes silent again"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ path = "src/main.rs"
 samp-client = { workspace = true }
 samp-proto = { workspace = true }
 raknet = { workspace = true }
+sa-nav = { workspace = true }
 samp-script = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-std", "io-util"] }
 anyhow = { workspace = true }

@@ -2,12 +2,13 @@
 -- Bundled "fly to coords" movement API for the headless bot. Fully typed against `host.d.luau`
 -- (the host-globals definition file), so it type-checks under `luau analyze --definitions=host.d.luau`.
 --
--- A headless bot has no GTA physics, so we craft the on-foot sync directly — but the server's
--- anti-cheat measures our reported position deltas, and a moving position with a ZERO move_speed
--- reads as a teleport/speed-hack (the dialog 19999 "подозрение в читерстве"). Ported from the real
--- launcher's "Вжух" coordmaster: each tick we advance the position toward the target AND report a
--- plausible velocity vector (move_speed) plus a walk animation, both ramped up from zero and
--- jittered, so the delta is backed by a matching velocity instead of a jump.
+-- This module used to BE the movement: a 10 Hz loop writing setBotPosition/setBotVelocity/setBotFacing
+-- itself, because the native walker could only reach points the navmesh bake covered — and the spots
+-- that matter (interaction pins, interiors, dropped carts) are routinely off it. That made two
+-- simulations of one body, which is how the speeds could disagree.
+-- The host now walks straight at an off-mesh point natively (`walkTo(..., "direct <gait>")`) with the
+-- real gait and a velocity measured from actual displacement, so this module is a thin adapter over
+-- it. The API is unchanged; callers did not move.
 --
 -- `fly.to(x, y, z, opts)` BLOCKS the calling coroutine (uses `wait()`), so call it from inside a task
 -- (`newTask`). It returns true on arrival, false if `fly.stop()` interrupted it. Flying only has an
@@ -17,19 +18,17 @@ require("addon") -- wait()/newTask scheduler
 
 -- The full movement-tuning shape (all fields required); `FlyOpts` is its all-optional public form.
 type FlyConfig = {
-    step: number, -- position units advanced per tick at full ramp
+    speed: number, -- units per SECOND at full ramp (time-integrated; never a per-tick step)
     tick: number, -- ms between on-foot syncs
-    speedMag: number, -- reported move_speed magnitude at full ramp
-    ramp: number, -- per-tick ramp of step+velocity
+    ramp: number, -- per-tick ramp of speed+velocity
     animId: number, -- on-foot walk animation index
     animFlags: number, -- on-foot walk animation flags
     arrive: number, -- stop when within this many units of the target
 }
 
 export type FlyOpts = {
-    step: number?,
+    speed: number?,
     tick: number?,
-    speedMag: number?,
     ramp: number?,
     animId: number?,
     animFlags: number?,
@@ -46,27 +45,35 @@ export type Fly = {
 
 local fly: Fly = {} :: Fly
 
--- Speeds match the reference "Вжух" coordmaster's on-foot LongSettings exactly (Pace 8, wait 230 ms,
--- move_speed 0.9): ~35 u/s with a reported velocity of 0.9 that stays consistent with the position
--- delta. This is the known-good bypass — step 9 (my earlier over-fast value) tripped Arizona's
--- "Speed Hack - Пешком(9/1)" kick (the "9" was the detected step); 8 is under the threshold.
+-- Movement is TIME-INTEGRATED at a LEGAL GTA-SA gait speed. The old tuning (a per-tick `step = 8` with a
+-- declared move_speed of 0.9) was measured against a real-client capture and was wrong on both axes:
+--   * `advance = step * ramp` carried NO dt term, so every sync moved exactly 8.000 units regardless of
+--     whether 32 ms or 404 ms had elapsed — 100% of our moving packets (78/78) breached the AC's ~2-unit
+--     on-foot snap threshold, versus 0.413 u median / 9.9% breach for the real client. That per-packet
+--     displacement is precisely what "Телепорт - Пешком(2 / 1)" measures.
+--   * a declared move_speed of 0.9 implies 45 u/s under the samp `move_speed = speed / 50` invariant —
+--     4.7x GAIT_SPRINT's ceiling of 0.1912 (9.56 u/s, driver.rs:122-124). Measured real-client ground
+--     speed: 3.72 u/s median, 12.38 u/s p99.
+-- So: integrate over ACTUAL elapsed time, cap at the sprint ceiling, and derive move_speed from the
+-- distance we really covered. Travel is ~2.6x slower than the old 25 u/s — that is the intended trade.
+local SPRINT_SPEED = 9.56 -- u/s — GAIT_SPRINT, the fastest legal on-foot gait (driver.rs GAIT_SPRINT)
+
+-- The native walker stops within its own arrival radius, so no caller can be satisfied tighter than
+-- this by walking alone; anything finer has to re-pin itself afterwards.
+local ARRIVE_FLOOR = 1.0
+
 local DEFAULTS: FlyConfig = {
-    step = 8, -- Pace: units advanced per tick at full ramp (~35 u/s at tick 230)
-    tick = 230, -- ms between on-foot syncs (reference WaitOnFoot)
-    speedMag = 0.9, -- reported move_speed magnitude at full ramp (reference on-foot LongSettings[4])
-    ramp = 0.25, -- per-tick ramp of step+velocity — fast accel so SHORT tree-to-tree hops reach speed
-    -- quickly instead of crawling through the ramp (max speed is still step 8, the AC-safe cap)
+    speed = SPRINT_SPEED, -- units per SECOND at full ramp, integrated by dt (never a per-tick jump)
+    tick = 100, -- ms between on-foot syncs — matches the real client's ~93 ms median moving cadence
+    ramp = 0.25, -- per-tick ramp of speed+velocity so short hops still accelerate quickly
     animId = 1189,
     animFlags = 7684,
-    arrive = 2.0,
+    arrive = 1.0, -- final snap stays UNDER the ~2 u snap threshold (was 2.0, and effectively 8.0 via `step`)
 }
 
 -- A shared flag so `fly.stop()` (or a new `fly.to`) interrupts an in-flight move.
 local flying = false
 
-local function jitter(scale: number): number
-    return (math.random(-1000, 1000) / 1000) * scale
-end
 
 -- Straight-line distance from the bot to (x, y, z).
 function fly.distance(x: number, y: number, z: number): number
@@ -89,82 +96,73 @@ end
 -- Interrupt any in-progress `fly.to` and clear the reported velocity/animation.
 function fly.stop()
     flying = false
+    walkStop()
     setBotVelocity(0, 0, 0)
-    setBotAnimation(0, 0)
+    setBotAnimation(1189, 0x8004) -- idle stance, not (0,0): anim 0 never appears in real on-foot traffic
     updateSync()
 end
 
 -- Blocking move to (x, y, z). Returns true on arrival, false if interrupted by `fly.stop()`.
+--
+-- This used to be a second physics simulation: a 10 Hz loop writing setBotPosition/setBotVelocity/
+-- setBotFacing/setBotAnimation itself, because the native walker could only reach points the navmesh
+-- bake covered — and interaction pins, interiors and dropped carts are routinely off it. The host now
+-- exposes a DIRECT seek (`walkTo(..., "direct <gait>")`) that walks straight at a point with the real
+-- gait, so the body is simulated in one place instead of two. The signature and semantics are
+-- unchanged; every caller keeps working.
 function fly.to(tx: number, ty: number, tz: number, opts: FlyOpts?): boolean
     local o: FlyOpts = opts or {}
-    local step = o.step or DEFAULTS.step
-    local tick = o.tick or DEFAULTS.tick
-    local speedMag = o.speedMag or DEFAULTS.speedMag
-    local rampRate = o.ramp or DEFAULTS.ramp
-    local animId = o.animId or DEFAULTS.animId
-    local animFlags = o.animFlags or DEFAULTS.animFlags
     local arrive = o.arrive or DEFAULTS.arrive
 
     fly.waitSpawn()
     flying = true
-    local ramp = 0.3 -- 0 → 1, scales both position step and reported velocity; start at 0.3 (not 0) so
-    -- a short hop moves at once instead of inching out of a standstill (velocity stays matched → AC-safe)
-    local sx, sy, sz = getBotPosition()
-    print(("[fly] start %.1f,%.1f,%.1f -> %.1f,%.1f,%.1f"):format(sx, sy, sz, tx, ty, tz))
-    local lastLog = os.clock()
 
-    while flying do
-        local x, y, z = getBotPosition()
-        -- Abort if the client dropped/reset (position zeroes on reconnect): don't keep driving a
-        -- stale flight while disconnected.
-        if x == 0 and y == 0 and z == 0 then
-            flying = false
-            print("[fly] aborted — not spawned (disconnected?)")
-            return false
-        end
-        local dx, dy, dz = tx - x, ty - y, tz - z
-        local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-        if os.clock() - lastLog >= 2 then
-            -- ETA = remaining distance / full-ramp speed (step units per tick → units/second).
-            local speed = step / (tick / 1000)
-            local eta = if speed > 0 then d / speed else 0
-            print(("[fly] pos %.1f,%.1f,%.1f | dist %.1f | ETA %.0fs"):format(x, y, z, d, eta))
-            lastLog = os.clock()
-        end
-
-        if d <= math.max(arrive, step) then
-            setBotPosition(tx, ty, tz)
-            setBotVelocity(0, 0, 0) -- stop moving: no reported velocity, drop the anim
-            setBotAnimation(0, 0)
-            updateSync()
-            flying = false
-            print(("[fly] arrived %.1f,%.1f,%.1f"):format(tx, ty, tz))
-            return true
-        end
-
-        if ramp < 1 then
-            ramp = math.min(1, ramp + rampRate)
-        end
-
-        local inv = 1 / d
-        local ux, uy, uz = dx * inv, dy * inv, dz * inv -- unit direction toward target
-
-        -- Advance the reported position by the ramped step (with a little jitter on Z).
-        local advance = step * ramp
-        setBotPosition(x + ux * advance, y + uy * advance, z + uz * advance + jitter(0.05))
-
-        -- Report a velocity in the travel direction (ramped + jittered) so the position delta is
-        -- backed by a matching move_speed rather than reading as a teleport, plus the walk animation.
-        local mag = speedMag * ramp
-        setBotVelocity(ux * mag + jitter(0.02), uy * mag + jitter(0.02), uz * mag + jitter(0.02))
-        setBotAnimation(animId, animFlags)
-        updateSync()
-
-        wait(tick)
+    -- `speed` was the script's own u/s cap; map it back onto the gait that produces it so callers that
+    -- asked for a slow approach still get one.
+    local speed = math.min(o.speed or DEFAULTS.speed, SPRINT_SPEED)
+    local gait = "direct sprint"
+    if speed <= 2.0 then
+        gait = "direct walk"
+    elseif speed <= 7.0 then
+        gait = "direct jog"
     end
 
-    return false -- interrupted by fly.stop()
+    walkTo(tx, ty, tz, gait)
+
+    -- Give the driver a few ticks to take the walk, then hold until it finishes. `isWalking()` is the
+    -- documented completion signal.
+    local started = false
+    for _ = 1, 6 do
+        wait(100)
+        if not flying then
+            walkStop()
+            return false
+        end
+        if isWalking() then
+            started = true
+            break
+        end
+    end
+
+    if started then
+        while flying and isWalking() do
+            wait(100)
+        end
+        if not flying then
+            walkStop()
+            return false
+        end
+    end
+
+    flying = false
+    if not started then
+        return false -- the walker never took it: no path, or already there and the caller can re-check
+    end
+    -- Judged in XY only. The walker deliberately never adopts the caller's Z (it is a world object's
+    -- origin, not a standing height), so a 3-D test would fail every successful walk onto a pickup.
+    local x, y = getBotPosition()
+    local dx, dy = tx - x, ty - y
+    return math.sqrt(dx * dx + dy * dy) <= math.max(arrive, ARRIVE_FLOOR)
 end
 
 return fly

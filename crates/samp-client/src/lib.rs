@@ -1,7 +1,11 @@
 //! SA-MP connection state machine and high-level [`Client`]: the crate root holds the public
-//! contract; the FSM lives in the private [`driver`] module over the [`transport`] seam; see
+//! contract; the FSM lives in the private [`engine`] module over the [`transport`] seam; see
 //! docs/memory/samp-client/lib.md#module.
 #![forbid(unsafe_code)]
+// The engine future is `!Send` (it holds `Rc` script closures), so holding a lock across an `.await`
+// COMPILES here — nothing but this lint stands between a shared world and a 50 Hz simulation stalling
+// behind a SOCKS5 send. Denied now, while there is no lock yet and it costs nothing.
+#![deny(clippy::await_holding_lock)]
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -11,17 +15,24 @@ use thiserror::Error;
 
 mod aim;
 mod client_emulation;
-mod driver;
+mod engine;
+mod locomotion;
 mod registry;
 mod state;
 mod transport;
+mod world;
 
+/// Added to a `walkTo` mode byte to ask for a DIRECT seek — a straight walk at the point, no navmesh
+/// corridor. Exported so the script host encodes the mode with the same constant the engine decodes
+/// it with, rather than a literal in each crate.
+pub use engine::DIRECT_MODE_BASE as WALK_MODE_DIRECT;
 pub use raknet::ProxyConfig;
 pub use registry::{Action, PacketRegistry};
 pub use samp_proto::{Direction, OutboundMsg, Outbox, Verdict};
 pub use state::{
     AimData, InVehicleData, LocalPlayer, OnFootData, SharedLocalPlayer, WeaponInventory,
 };
+pub use world::{EntityRef, EntitySnapshot, EntityView};
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
@@ -174,7 +185,7 @@ pub enum ClientEvent {
 
 /// High-level async SA-MP client. Owns a [`raknet::RakHandle`] and drives the FSM.
 pub struct Client {
-    driver: driver::Driver<transport::RakTransport>,
+    engine: engine::Engine<transport::RakTransport>,
 }
 
 impl Client {
@@ -187,8 +198,9 @@ impl Client {
             pcap: config.pcap.clone(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
-        let driver = driver::Driver::new(config, transport);
-        Ok(Self { driver })
+        let engine = engine::Engine::new(config, transport);
+        engine.spawn_physics();
+        Ok(Self { engine })
     }
 
     /// Connect with a [`PacketRegistry`] attached; the resulting client is `!Send` (holds script
@@ -205,31 +217,38 @@ impl Client {
             pcap: config.pcap.clone(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
-        let driver = driver::Driver::new(config, transport)
+        let engine = engine::Engine::new(config, transport)
             .with_registry(registry)
             .with_bot_state(bot_state);
-        Ok(Self { driver })
+        engine.spawn_physics();
+        Ok(Self { engine })
+    }
+
+    /// Read-only view of the entities streamed in around the bot, refreshed each send tick. Hand this
+    /// to the script host so scripts can query the world instead of rebuilding pools from raw RPCs.
+    pub fn entities(&self) -> EntityView {
+        self.engine.entities()
     }
 
     /// Current connection state.
     pub fn state(&self) -> &ConnectionState {
-        self.driver.state()
+        self.engine.state()
     }
 
     /// Pump the state machine, yielding the next client-facing event. `None` when closed.
     pub async fn next_event(&mut self) -> Option<ClientEvent> {
-        self.driver.next_event().await
+        self.engine.next_event().await
     }
 
     /// Send a chat line as the local player (`RPC_Chat`); `text` is raw server-encoding bytes (cp1251
     /// for Arizona), truncated to 255 bytes (single-byte length).
     pub async fn send_chat(&mut self, text: &[u8]) {
-        self.driver.send_chat(text).await;
+        self.engine.send_chat(text).await;
     }
 
     /// Gracefully disconnect, sending a `DISCONNECTION_NOTIFICATION` and closing the transport.
     pub async fn disconnect(mut self) -> Result<()> {
-        self.driver.disconnect().await?;
+        self.engine.disconnect().await?;
         Ok(())
     }
 }

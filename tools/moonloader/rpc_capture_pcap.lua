@@ -209,6 +209,9 @@ local serverPort = 7777
 
 -- Write one message to the pcap: frame → (cipher if outbound) → IPv4+UDP → record.
 local function writeRecord(outbound, payload)
+    if not logFile then
+        return -- RPC/packet events fire during SAMP init, before main() opens the file — skip until ready
+    end
     local datagram = frameDatagram(payload)
     local udpPayload = outbound and encrypt(datagram, serverPort) or datagram
 
@@ -281,7 +284,10 @@ function main()
         serverPort = port
     end
 
-    logFile = io.open(getWorkingDirectory() .. "\\rpc_capture.pcap", "wb")
+    -- UNIQUE filename per launch (os.time) — never overwrite. The launcher/game relaunches truncated the
+    -- single `rpc_capture.pcap` and LOST the registration session; a per-run name preserves every session.
+    local capName = "rpc_capture_" .. tostring(os.time()) .. ".pcap"
+    logFile = io.open(getWorkingDirectory() .. "\\" .. capName, "wb")
     -- libpcap global header, little-endian (matches raknet::pcap::create):
     -- magic 0xA1B2C3D4, version 2.4, thiszone 0, sigfigs 0, snaplen 65535, LINKTYPE_RAW 101.
     logFile:write(le32(0xA1B2C3D4))
@@ -292,8 +298,8 @@ function main()
     logFile:write(le32(101)) -- LINKTYPE_RAW
     logFile:flush()
 
-    sampAddChatMessage(("[RPC Capture pcap] -> rpc_capture.pcap (server %d.%d.%d.%d:%d)"):format(
-        serverIp[1], serverIp[2], serverIp[3], serverIp[4], serverPort), 0xFF44FF44)
+    sampAddChatMessage(("[RPC Capture pcap] -> %s (server %d.%d.%d.%d:%d)"):format(
+        capName, serverIp[1], serverIp[2], serverIp[3], serverIp[4], serverPort), 0xFF44FF44)
     wait(-1)
 end
 

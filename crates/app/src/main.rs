@@ -232,8 +232,30 @@ fn resolve_server(server: &str) -> anyhow::Result<SocketAddr> {
         .ok_or_else(|| anyhow!("no addresses resolved for `{server}`"))
 }
 
+/// Write every panic to a fixed `crash.log` (append mode, one line per panic) unconditionally — even if
+/// the tracing subscriber's own file/stdout writers are themselves the thing wedged. A run that dies
+/// silently mid-session (no disconnect/error logged, log and network traffic stop simultaneously) is
+/// otherwise indistinguishable from a genuine unlogged hang; this closes that gap for the panic case.
+fn install_crash_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let nick = std::env::var("RAKCLIENT_LOG").unwrap_or_else(|_| "rakclient.log".to_string());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("crash.log")
+        {
+            let _ = writeln!(f, "=== panic in run logging to {nick} ===\n{info}");
+        }
+        default_hook(info);
+    }));
+}
+
 fn init_tracing() {
     use tracing_subscriber::prelude::*;
+
+    install_crash_hook();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stdout_layer = tracing_subscriber::fmt::layer();
@@ -351,6 +373,15 @@ async fn wire_script_engine(
     engine
         .set_global("sampNick", config.nick.clone())
         .map_err(|e| anyhow!("setting sampNick: {e}"))?;
+    // Co-op slot for dual-sawmill scripts (run.ps1 -Slot → LUMBER_SLOT env); 0/unset = solo. Injected as
+    // a Lua global because Luau's sandboxed `os` has no `getenv`.
+    let lumber_slot: i64 = std::env::var("LUMBER_SLOT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    engine
+        .set_global("LUMBER_SLOT", lumber_slot)
+        .map_err(|e| anyhow!("setting LUMBER_SLOT: {e}"))?;
     // Load each script now that bindings/globals are in place (a script may use them on load).
     for path in scripts {
         let source = std::fs::read_to_string(path)
@@ -385,9 +416,13 @@ async fn wire_script_engine(
     // The task scheduler tick (`newTask`/`wait` run on `registerHandler('onUpdate')`).
     let update_handler = engine.clone();
     registry.on_update(move || update_handler.dispatch_update());
-    Client::connect_with_registry(config, registry, bot_state)
+    let client = Client::connect_with_registry(config, registry, bot_state)
         .await
-        .context("failed to connect to server")
+        .context("failed to connect to server")?;
+    engine
+        .install_entities(client.entities())
+        .map_err(|e| anyhow!("installing entity queries: {e}"))?;
+    Ok(client)
 }
 
 #[tokio::main]
@@ -478,7 +513,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    // Best-effort graceful leave: tell the transport actor to send a DISCONNECTION_NOTIFICATION,
+    // bounded by a timeout so a dead/kicked link (disconnect would just error `not connected`) can't
+    // stall shutdown.
+    let _ = tokio::time::timeout(Duration::from_millis(500), client.disconnect()).await;
+
+    // Hard-exit instead of returning `Ok(())`: the stdin reader spawned above runs on tokio's blocking
+    // pool via `tokio::io::stdin()`, whose ReadFile syscall on Windows can't be cancelled. On a plain
+    // return the runtime's Drop blocks forever trying to join that thread, so the process hangs after
+    // "client closed" / Ctrl-C. Exiting here terminates cleanly once the graceful leave has been sent.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
