@@ -522,7 +522,10 @@ impl PeerTask {
         self.last_handshake = Instant::now();
         let mut payload = vec![ID_CONNECTION_REQUEST];
         if let Some(pw) = &self.config.password {
+            // open.mp stores the configured password with its NUL terminator and compares the
+            // lengths, so a bare 9-byte "lsrcrtest" is rejected as an invalid 9 != 10 password.
             payload.extend_from_slice(pw.as_bytes());
+            payload.push(0);
         }
         self.rel.enqueue(&payload, Reliability::Reliable, 0);
         let now = Instant::now();
