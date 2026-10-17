@@ -1437,6 +1437,8 @@ dependencies = [
 [[package]]
 name = "rerecast"
 version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd207dd0644bd506d8017195865d72274dae648923596438255a0da00836f548"
 dependencies = [
  "anyhow",
  "bevy_reflect",
